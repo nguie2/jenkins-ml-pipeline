@@ -36,61 +36,9 @@ This project solves these critical enterprise pain points:
 ### **Multi-Cloud Support**
 Deploy seamlessly across AWS EKS, Azure AKS, or Google GKE with native cloud service integration.
 
-```mermaid
-graph TB
-    subgraph "Multi-Cloud Infrastructure"
-        AWS[AWS EKS<br/>S3 + ECR + IAM]
-        AZURE[Azure AKS<br/>Blob + ACR + KeyVault]
-        GCP[Google GKE<br/>Storage + AR + SecretMgr]
-    end
-    
-    subgraph "Development"
-        DEV[Developer] --> GIT[Git Repository]
-        GIT --> HOOK[Git Webhooks]
-    end
-    
-    subgraph "Jenkins CI/CD"
-        HOOK --> JENKINS[Jenkins Controller]
-        JENKINS --> AGENT1[Jenkins Agent 1]
-        JENKINS --> AGENT2[Jenkins Agent 2]
-        JENKINS --> AGENT3[Jenkins Agent N]
-    end
-    
-    subgraph "ML Pipeline Stages"
-        AGENT1 --> TEST[Data Validation & Tests]
-        AGENT2 --> BUILD[Model Training & Build]
-        AGENT3 --> DEPLOY[Canary Deployment]
-    end
-    
-    subgraph "Observability Stack"
-        EFK[EFK Stack<br/>Logs]
-        JAEGER[Jaeger<br/>Traces]
-        PROM[Prometheus<br/>Metrics]
-        GRAFANA[Grafana<br/>Dashboards]
-    end
-    
-    subgraph "Security & Registry"
-        VAULT[HashiCorp Vault]
-        NEXUS[Nexus Repository]
-        TRIVY[Trivy Scanner]
-    end
-    
-    subgraph "Deployment Target"
-        ARGO[Argo Rollouts]
-        K8S[Kubernetes Cluster]
-        MODELS[ML Models]
-    end
-    
-    AWS --> JENKINS
-    AZURE --> JENKINS
-    GCP --> JENKINS
-    TEST --> EFK
-    BUILD --> NEXUS
-    DEPLOY --> ARGO
-    ARGO --> K8S
-    K8S --> MODELS
-    MODELS --> GRAFANA
-```
+![MLOps Architecture](docs/images/mlops-architecture-diagram.png)
+
+*Complete end-to-end MLOps pipeline architecture showing the integration of Jenkins CI/CD, observability stack, security components, and ML-specific tools for production-ready machine learning deployments.*
 
 ---
 
@@ -521,6 +469,7 @@ jenkins-ml-pipeline/
 │   └── policies/             # Security policies
 │
 ├── 📚 docs/                  # Documentation
+│   ├── images/               # Architecture diagrams and visuals
 │   ├── architecture/         # System design docs
 │   ├── deployment/           # Deployment guides
 │   ├── development/          # Developer guides
