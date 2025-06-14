@@ -1,0 +1,499 @@
+# OpenTelemetry Configuration for ML Models
+# Author: Nguie Angoue Jean Roch Junior
+# Email: nguierochjunior@gmail.com
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-config
+  namespace: monitoring
+  labels:
+    app: jenkins-ml-pipeline
+    component: observability
+data:
+  config.yaml: |
+    receivers:
+      # OTLP receiver for traces, metrics, and logs
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+            cors:
+              allowed_origins:
+                - "*"
+      
+      # Prometheus receiver for metrics scraping
+      prometheus:
+        config:
+          global:
+            scrape_interval: 15s
+            evaluation_interval: 15s
+          scrape_configs:
+            - job_name: 'ml-models'
+              static_configs:
+                - targets: ['ml-model:8080']
+              metrics_path: /metrics
+              scrape_interval: 5s
+              
+            - job_name: 'jenkins'
+              static_configs:
+                - targets: ['jenkins.jenkins.svc.cluster.local:8080']
+              metrics_path: /prometheus
+              scrape_interval: 30s
+              
+            - job_name: 'kubernetes-pods'
+              kubernetes_sd_configs:
+                - role: pod
+              relabel_configs:
+                - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                  action: keep
+                  regex: true
+                - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+                  action: replace
+                  target_label: __metrics_path__
+                  regex: (.+)
+      
+      # Jaeger receiver for legacy traces
+      jaeger:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:14250
+          thrift_http:
+            endpoint: 0.0.0.0:14268
+          thrift_compact:
+            endpoint: 0.0.0.0:6831
+          thrift_binary:
+            endpoint: 0.0.0.0:6832
+      
+      # Zipkin receiver
+      zipkin:
+        endpoint: 0.0.0.0:9411
+      
+      # Kubernetes cluster receiver
+      k8s_cluster:
+        auth_type: serviceAccount
+        node: ${K8S_NODE_NAME}
+        metadata_exporters: [prometheus]
+        
+    processors:
+      # Batch processor for better performance
+      batch:
+        timeout: 1s
+        send_batch_size: 1024
+        send_batch_max_size: 2048
+      
+      # Memory limiter to prevent OOM
+      memory_limiter:
+        limit_mib: 512
+        spike_limit_mib: 128
+        check_interval: 5s
+      
+      # Resource processor to add metadata
+      resource:
+        attributes:
+          - key: service.namespace
+            value: ${K8S_NAMESPACE}
+            action: upsert
+          - key: service.instance.id
+            value: ${K8S_POD_NAME}
+            action: upsert
+          - key: k8s.cluster.name
+            value: jenkins-ml-pipeline
+            action: upsert
+          - key: deployment.environment
+            value: ${ENVIRONMENT}
+            action: upsert
+      
+      # Probabilistic sampler for trace sampling
+      probabilistic_sampler:
+        sampling_percentage: 10
+      
+      # Tail sampling for intelligent trace sampling
+      tail_sampling:
+        decision_wait: 10s
+        num_traces: 100
+        expected_new_traces_per_sec: 10
+        policies:
+          - name: policy-errors
+            type: status_code
+            status_code:
+              status_codes: [ERROR]
+          - name: policy-slow
+            type: latency
+            latency:
+              threshold_ms: 1000
+          - name: policy-ml-inference
+            type: string_attribute
+            string_attribute:
+              key: service.name
+              values: ["ml-model-inference"]
+          - name: policy-sample
+            type: probabilistic
+            probabilistic:
+              sampling_percentage: 5
+      
+      # Attributes processor for ML-specific metadata
+      attributes:
+        actions:
+          - key: ml.model.name
+            action: insert
+            from_attribute: model_name
+          - key: ml.model.version
+            action: insert
+            from_attribute: model_version
+          - key: ml.prediction.confidence
+            action: insert
+            from_attribute: prediction_confidence
+          - key: ml.data.drift_score
+            action: insert
+            from_attribute: drift_score
+          - key: ml.bias.score
+            action: insert
+            from_attribute: bias_score
+    
+    exporters:
+      # Jaeger exporter for traces
+      jaeger:
+        endpoint: jaeger-collector.monitoring.svc.cluster.local:14250
+        tls:
+          insecure: true
+        headers:
+          x-tenant-id: jenkins-ml-pipeline
+      
+      # Prometheus exporter for metrics
+      prometheus:
+        endpoint: "0.0.0.0:8889"
+        namespace: ml_pipeline
+        const_labels:
+          cluster: jenkins-ml-pipeline
+          environment: ${ENVIRONMENT}
+        metric_relabeling:
+          - source_labels: [__name__]
+            regex: 'ml_.*'
+            target_label: ml_metric
+            replacement: 'true'
+      
+      # Prometheus remote write
+      prometheusremotewrite:
+        endpoint: http://prometheus-server.monitoring.svc.cluster.local:9090/api/v1/write
+        tls:
+          insecure: true
+        headers:
+          X-Prometheus-Remote-Write-Version: "0.1.0"
+      
+      # Elasticsearch exporter for logs and traces
+      elasticsearch:
+        endpoints: 
+          - http://elasticsearch-master.logging.svc.cluster.local:9200
+        index: otel-traces-%{+yyyy.MM.dd}
+        pipeline: traces-pipeline
+        mapping:
+          mode: raw
+        timeout: 30s
+        retry_on_failure:
+          enabled: true
+          initial_interval: 100ms
+          max_interval: 1m
+          max_elapsed_time: 10m
+      
+      # Logging exporter for debugging
+      logging:
+        loglevel: info
+        sampling_initial: 5
+        sampling_thereafter: 200
+    
+    extensions:
+      # Health check extension
+      health_check:
+        endpoint: 0.0.0.0:13133
+        path: /health
+      
+      # Performance profiler
+      pprof:
+        endpoint: 0.0.0.0:1777
+      
+      # Memory ballast
+      memory_ballast:
+        size_mib: 64
+      
+      # Kubernetes observability
+      k8s_observer:
+        auth_type: serviceAccount
+        node: ${K8S_NODE_NAME}
+        observe_pods: true
+        observe_nodes: true
+    
+    service:
+      extensions: [health_check, pprof, memory_ballast, k8s_observer]
+      
+      pipelines:
+        # Traces pipeline
+        traces:
+          receivers: [otlp, jaeger, zipkin]
+          processors: [memory_limiter, resource, attributes, tail_sampling, batch]
+          exporters: [jaeger, elasticsearch, logging]
+        
+        # Metrics pipeline
+        metrics:
+          receivers: [otlp, prometheus, k8s_cluster]
+          processors: [memory_limiter, resource, batch]
+          exporters: [prometheus, prometheusremotewrite, logging]
+        
+        # Logs pipeline
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, resource, batch]
+          exporters: [elasticsearch, logging]
+      
+      telemetry:
+        logs:
+          level: info
+          development: false
+          sampling:
+            initial: 5
+            thereafter: 200
+        metrics:
+          level: detailed
+          address: 0.0.0.0:8888
+        traces:
+          level: detailed
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: monitoring
+  labels:
+    app: jenkins-ml-pipeline
+    component: otel-collector
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+        component: observability
+    spec:
+      serviceAccountName: otel-collector
+      containers:
+      - name: otel-collector
+        image: otel/opentelemetry-collector-contrib:0.89.0
+        imagePullPolicy: IfNotPresent
+        command:
+          - /otelcol-contrib
+          - --config=/etc/otel-collector-config/config.yaml
+        env:
+        - name: K8S_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: K8S_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: K8S_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: ENVIRONMENT
+          value: "production"
+        ports:
+        - containerPort: 4317
+          name: otlp-grpc
+          protocol: TCP
+        - containerPort: 4318
+          name: otlp-http
+          protocol: TCP
+        - containerPort: 14250
+          name: jaeger-grpc
+          protocol: TCP
+        - containerPort: 14268
+          name: jaeger-http
+          protocol: TCP
+        - containerPort: 6831
+          name: jaeger-compact
+          protocol: UDP
+        - containerPort: 6832
+          name: jaeger-binary
+          protocol: UDP
+        - containerPort: 9411
+          name: zipkin
+          protocol: TCP
+        - containerPort: 8889
+          name: prometheus
+          protocol: TCP
+        - containerPort: 13133
+          name: health
+          protocol: TCP
+        - containerPort: 8888
+          name: metrics
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 13133
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 13133
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: otel-collector-config
+          mountPath: /etc/otel-collector-config
+          readOnly: true
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+          capabilities:
+            drop:
+              - ALL
+      volumes:
+      - name: otel-collector-config
+        configMap:
+          name: otel-config
+          items:
+          - key: config.yaml
+            path: config.yaml
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: monitoring
+  labels:
+    app: jenkins-ml-pipeline
+    component: otel-collector
+spec:
+  type: ClusterIP
+  ports:
+  - name: otlp-grpc
+    port: 4317
+    targetPort: 4317
+    protocol: TCP
+  - name: otlp-http
+    port: 4318
+    targetPort: 4318
+    protocol: TCP
+  - name: jaeger-grpc
+    port: 14250
+    targetPort: 14250
+    protocol: TCP
+  - name: jaeger-http
+    port: 14268
+    targetPort: 14268
+    protocol: TCP
+  - name: jaeger-compact
+    port: 6831
+    targetPort: 6831
+    protocol: UDP
+  - name: jaeger-binary
+    port: 6832
+    targetPort: 6832
+    protocol: UDP
+  - name: zipkin
+    port: 9411
+    targetPort: 9411
+    protocol: TCP
+  - name: prometheus
+    port: 8889
+    targetPort: 8889
+    protocol: TCP
+  - name: health
+    port: 13133
+    targetPort: 13133
+    protocol: TCP
+  - name: metrics
+    port: 8888
+    targetPort: 8888
+    protocol: TCP
+  selector:
+    app: otel-collector
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector
+  namespace: monitoring
+  labels:
+    app: jenkins-ml-pipeline
+    component: otel-collector
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector
+  labels:
+    app: jenkins-ml-pipeline
+    component: otel-collector
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes", "services", "endpoints", "namespaces"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "daemonsets", "statefulsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["extensions"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector
+  labels:
+    app: jenkins-ml-pipeline
+    component: otel-collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: otel-collector
+subjects:
+- kind: ServiceAccount
+  name: otel-collector
+  namespace: monitoring
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: otel-collector
+  namespace: monitoring
+  labels:
+    app: jenkins-ml-pipeline
+    component: otel-collector
+spec:
+  selector:
+    matchLabels:
+      app: otel-collector
+  endpoints:
+  - port: metrics
+    interval: 15s
+    path: /metrics
+  - port: prometheus
+    interval: 15s
+    path: /metrics 

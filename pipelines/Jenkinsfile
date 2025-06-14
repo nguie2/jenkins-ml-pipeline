@@ -1,0 +1,678 @@
+#!/usr/bin/env groovy
+
+/**
+ * Jenkins ML Pipeline - Enterprise MLOps CI/CD
+ * Author: Nguie Angoue Jean Roch Junior
+ * Email: nguierochjunior@gmail.com
+ * 
+ * This pipeline implements a complete MLOps workflow with:
+ * - Parallel testing stages
+ * - Data validation with Great Expectations
+ * - Model training and validation
+ * - Security scanning with Trivy
+ * - Canary deployment with Argo Rollouts
+ * - Comprehensive observability
+ */
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: jenkins-ml-pipeline
+    version: v1
+spec:
+  serviceAccountName: jenkins
+  containers:
+  - name: python
+    image: python:3.11-slim
+    command:
+    - cat
+    tty: true
+    resources:
+      requests:
+        memory: "1Gi"
+        cpu: "500m"
+      limits:
+        memory: "2Gi"
+        cpu: "1"
+    volumeMounts:
+    - name: docker-sock
+      mountPath: /var/run/docker.sock
+  - name: docker
+    image: docker:24-dind
+    securityContext:
+      privileged: true
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "250m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
+  - name: kubectl
+    image: bitnami/kubectl:1.28
+    command:
+    - cat
+    tty: true
+  - name: trivy
+    image: aquasecurity/trivy:latest
+    command:
+    - cat
+    tty: true
+  - name: terraform
+    image: hashicorp/terraform:1.6
+    command:
+    - cat
+    tty: true
+  volumes:
+  - name: docker-sock
+    hostPath:
+      path: /var/run/docker.sock
+"""
+        }
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+        skipDefaultCheckout()
+    }
+
+    environment {
+        // Registry configuration
+        DOCKER_REGISTRY = "nexus.jenkins.svc.cluster.local:5000"
+        MODEL_REGISTRY = "nexus.jenkins.svc.cluster.local:8081"
+        
+        // Application configuration
+        APP_NAME = "ml-model"
+        APP_VERSION = "${BUILD_NUMBER}"
+        DOCKER_TAG = "${DOCKER_REGISTRY}/${APP_NAME}:${APP_VERSION}"
+        
+        // Environment configuration
+        ENVIRONMENT = "${params.ENVIRONMENT ?: 'development'}"
+        NAMESPACE = "ml-models-${ENVIRONMENT}"
+        
+        // Security
+        VAULT_ADDR = "http://vault.security.svc.cluster.local:8200"
+        VAULT_TOKEN = credentials('vault-token')
+        
+        // Observability
+        JAEGER_ENDPOINT = "http://jaeger-collector.monitoring.svc.cluster.local:14268"
+        PROMETHEUS_GATEWAY = "http://prometheus-pushgateway.monitoring.svc.cluster.local:9091"
+        
+        // ML-specific
+        DVC_REMOTE = "s3://ml-data-bucket"
+        MODEL_THRESHOLD_ACCURACY = "0.85"
+        DRIFT_THRESHOLD = "0.1"
+        BIAS_THRESHOLD = "0.05"
+    }
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['development', 'staging', 'production'],
+            description: 'Target environment'
+        )
+        booleanParam(
+            name: 'SKIP_TESTS',
+            defaultValue: false,
+            description: 'Skip test execution'
+        )
+        booleanParam(
+            name: 'DEPLOY_MODEL',
+            defaultValue: true,
+            description: 'Deploy model after successful build'
+        )
+        booleanParam(
+            name: 'CANARY_DEPLOYMENT',
+            defaultValue: true,
+            description: 'Use canary deployment strategy'
+        )
+        string(
+            name: 'MODEL_VERSION',
+            defaultValue: '',
+            description: 'Specific model version to deploy (optional)'
+        )
+    }
+
+    stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    // Checkout code
+                    checkout scm
+                    
+                    // Set build metadata
+                    currentBuild.displayName = "#${BUILD_NUMBER} - ${ENVIRONMENT}"
+                    currentBuild.description = "ML Pipeline for ${params.MODEL_VERSION ?: 'latest'}"
+                    
+                    // Initialize tracing
+                    sh '''
+                        echo "Starting trace for build ${BUILD_NUMBER}"
+                        curl -X POST "${JAEGER_ENDPOINT}/api/traces" \
+                            -H "Content-Type: application/json" \
+                            -d '{
+                                "traceID": "'${BUILD_NUMBER}'",
+                                "spans": [{
+                                    "spanID": "init-'${BUILD_NUMBER}'",
+                                    "operationName": "pipeline-init",
+                                    "startTime": '$(date +%s%N)',
+                                    "tags": {
+                                        "environment": "'${ENVIRONMENT}'",
+                                        "build.number": "'${BUILD_NUMBER}'",
+                                        "git.commit": "'${GIT_COMMIT}'"
+                                    }
+                                }]
+                            }' || true
+                    '''
+                }
+            }
+        }
+
+        stage('Parallel Quality Gates') {
+            parallel {
+                stage('Code Quality & Security') {
+                    steps {
+                        container('python') {
+                            script {
+                                sh '''
+                                    echo "Installing dependencies..."
+                                    pip install --no-cache-dir \
+                                        pylint==3.0.* \
+                                        black==23.* \
+                                        bandit==1.7.* \
+                                        safety==2.3.* \
+                                        pytest==7.4.* \
+                                        pytest-cov==4.1.*
+                                    
+                                    echo "Running code formatting check..."
+                                    black --check --diff src/ tests/ || {
+                                        echo "Code formatting issues found. Run 'black src/ tests/' to fix."
+                                        exit 1
+                                    }
+                                    
+                                    echo "Running linting..."
+                                    pylint src/ --fail-under=8.0
+                                    
+                                    echo "Running security scan..."
+                                    bandit -r src/ -f json -o bandit-report.json || true
+                                    
+                                    echo "Checking dependencies for vulnerabilities..."
+                                    safety check --json --output safety-report.json || true
+                                '''
+                                
+                                // Publish security reports
+                                publishHTML([
+                                    allowMissing: false,
+                                    alwaysLinkToLastBuild: true,
+                                    keepAll: true,
+                                    reportDir: '.',
+                                    reportFiles: 'bandit-report.json,safety-report.json',
+                                    reportName: 'Security Scan Report'
+                                ])
+                            }
+                        }
+                    }
+                }
+
+                stage('Data Validation') {
+                    steps {
+                        container('python') {
+                            script {
+                                sh '''
+                                    echo "Installing Great Expectations..."
+                                    pip install --no-cache-dir great-expectations==0.18.*
+                                    
+                                    echo "Initializing Great Expectations..."
+                                    great_expectations init || true
+                                    
+                                    echo "Running data validation..."
+                                    python scripts/validate_data.py \
+                                        --data-path data/raw/ \
+                                        --expectations-path great_expectations/expectations/ \
+                                        --output-path validation-results.json
+                                    
+                                    echo "Checking data validation results..."
+                                    python -c "
+import json
+with open('validation-results.json', 'r') as f:
+    results = json.load(f)
+if not results.get('success', False):
+    print('Data validation failed!')
+    print(json.dumps(results, indent=2))
+    exit(1)
+print('Data validation passed!')
+"
+                                '''
+                                
+                                // Archive validation results
+                                archiveArtifacts artifacts: 'validation-results.json', fingerprint: true
+                            }
+                        }
+                    }
+                }
+
+                stage('Unit Tests') {
+                    when {
+                        not { params.SKIP_TESTS }
+                    }
+                    steps {
+                        container('python') {
+                            script {
+                                sh '''
+                                    echo "Installing test dependencies..."
+                                    pip install --no-cache-dir -r requirements-test.txt
+                                    
+                                    echo "Running unit tests with coverage..."
+                                    pytest tests/unit/ \
+                                        --cov=src/ \
+                                        --cov-report=xml \
+                                        --cov-report=html \
+                                        --junitxml=unit-test-results.xml \
+                                        --cov-fail-under=80
+                                '''
+                                
+                                // Publish test results
+                                publishTestResults testResultsPattern: 'unit-test-results.xml'
+                                publishCoverage adapters: [
+                                    coberturaAdapter('coverage.xml')
+                                ], sourceFileResolver: sourceFiles('STORE_LAST_BUILD')
+                            }
+                        }
+                    }
+                }
+
+                stage('Integration Tests') {
+                    when {
+                        not { params.SKIP_TESTS }
+                    }
+                    steps {
+                        container('python') {
+                            script {
+                                sh '''
+                                    echo "Running integration tests..."
+                                    pytest tests/integration/ \
+                                        --junitxml=integration-test-results.xml \
+                                        -v
+                                '''
+                                
+                                publishTestResults testResultsPattern: 'integration-test-results.xml'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Model Training & Validation') {
+            parallel {
+                stage('Train Model') {
+                    steps {
+                        container('python') {
+                            script {
+                                sh '''
+                                    echo "Installing ML dependencies..."
+                                    pip install --no-cache-dir -r requirements.txt
+                                    
+                                    echo "Setting up DVC..."
+                                    dvc remote add -d storage ${DVC_REMOTE} || true
+                                    dvc pull || echo "No data to pull from DVC"
+                                    
+                                    echo "Training model..."
+                                    python src/train.py \
+                                        --data-path data/processed/ \
+                                        --output-path models/ \
+                                        --experiment-name "build-${BUILD_NUMBER}" \
+                                        --log-level INFO
+                                    
+                                    echo "Saving model artifacts..."
+                                    dvc add models/
+                                    dvc push || echo "Failed to push to DVC"
+                                '''
+                                
+                                // Archive model artifacts
+                                archiveArtifacts artifacts: 'models/**/*', fingerprint: true
+                            }
+                        }
+                    }
+                }
+
+                stage('Model Validation') {
+                    steps {
+                        container('python') {
+                            script {
+                                sh '''
+                                    echo "Installing validation dependencies..."
+                                    pip install --no-cache-dir \
+                                        alibi-detect==0.12.* \
+                                        evidently==0.4.*
+                                    
+                                    echo "Running model performance validation..."
+                                    python scripts/validate_model.py \
+                                        --model-path models/latest/ \
+                                        --test-data data/test/ \
+                                        --threshold ${MODEL_THRESHOLD_ACCURACY} \
+                                        --output-path model-validation-results.json
+                                    
+                                    echo "Running bias detection..."
+                                    python scripts/detect_bias.py \
+                                        --model-path models/latest/ \
+                                        --test-data data/test/ \
+                                        --threshold ${BIAS_THRESHOLD} \
+                                        --output-path bias-detection-results.json
+                                    
+                                    echo "Running drift detection..."
+                                    python scripts/detect_drift.py \
+                                        --reference-data data/reference/ \
+                                        --current-data data/test/ \
+                                        --threshold ${DRIFT_THRESHOLD} \
+                                        --output-path drift-detection-results.json
+                                '''
+                                
+                                // Check validation results
+                                script {
+                                    def validation = readJSON file: 'model-validation-results.json'
+                                    def bias = readJSON file: 'bias-detection-results.json'
+                                    def drift = readJSON file: 'drift-detection-results.json'
+                                    
+                                    if (!validation.passed) {
+                                        error("Model validation failed: ${validation.message}")
+                                    }
+                                    
+                                    if (!bias.passed) {
+                                        error("Bias detection failed: ${bias.message}")
+                                    }
+                                    
+                                    if (!drift.passed) {
+                                        error("Drift detection failed: ${drift.message}")
+                                    }
+                                }
+                                
+                                // Archive validation results
+                                archiveArtifacts artifacts: '*-validation-results.json,*-detection-results.json', fingerprint: true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build & Scan Container') {
+            steps {
+                container('docker') {
+                    script {
+                        sh '''
+                            echo "Building Docker image..."
+                            docker build -t ${DOCKER_TAG} .
+                            
+                            echo "Tagging image as latest..."
+                            docker tag ${DOCKER_TAG} ${DOCKER_REGISTRY}/${APP_NAME}:latest
+                        '''
+                    }
+                }
+                
+                container('trivy') {
+                    script {
+                        sh '''
+                            echo "Scanning image for vulnerabilities..."
+                            trivy image \
+                                --format json \
+                                --output trivy-report.json \
+                                --severity HIGH,CRITICAL \
+                                ${DOCKER_TAG}
+                            
+                            echo "Generating SBOM..."
+                            trivy image \
+                                --format spdx-json \
+                                --output sbom.json \
+                                ${DOCKER_TAG}
+                            
+                            echo "Checking scan results..."
+                            CRITICAL_VULNS=$(cat trivy-report.json | jq '.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL") | length' | wc -l)
+                            if [ "$CRITICAL_VULNS" -gt 0 ]; then
+                                echo "Critical vulnerabilities found: $CRITICAL_VULNS"
+                                exit 1
+                            fi
+                        '''
+                        
+                        // Publish security reports
+                        publishHTML([
+                            allowMissing: false,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: true,
+                            reportDir: '.',
+                            reportFiles: 'trivy-report.json',
+                            reportName: 'Container Security Scan'
+                        ])
+                        
+                        // Archive SBOM
+                        archiveArtifacts artifacts: 'sbom.json', fingerprint: true
+                    }
+                }
+            }
+        }
+
+        stage('Push to Registry') {
+            steps {
+                container('docker') {
+                    script {
+                        sh '''
+                            echo "Pushing image to registry..."
+                            docker push ${DOCKER_TAG}
+                            docker push ${DOCKER_REGISTRY}/${APP_NAME}:latest
+                            
+                            echo "Uploading model to Nexus..."
+                            curl -v -u admin:admin123 \
+                                --upload-file models/model.pkl \
+                                "http://${MODEL_REGISTRY}/repository/ml-models/${APP_NAME}/${APP_VERSION}/model.pkl"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Deploy Model') {
+            when {
+                expression { params.DEPLOY_MODEL }
+            }
+            steps {
+                container('kubectl') {
+                    script {
+                        sh '''
+                            echo "Creating namespace if not exists..."
+                            kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+                            
+                            echo "Generating deployment manifests..."
+                            envsubst < k8s/deployment-template.yaml > k8s/deployment.yaml
+                            envsubst < k8s/service-template.yaml > k8s/service.yaml
+                            
+                            echo "Applying manifests..."
+                            kubectl apply -f k8s/deployment.yaml -n ${NAMESPACE}
+                            kubectl apply -f k8s/service.yaml -n ${NAMESPACE}
+                        '''
+                        
+                        if (params.CANARY_DEPLOYMENT && env.ENVIRONMENT == 'production') {
+                            sh '''
+                                echo "Setting up canary deployment with Argo Rollouts..."
+                                envsubst < k8s/rollout-template.yaml > k8s/rollout.yaml
+                                kubectl apply -f k8s/rollout.yaml -n ${NAMESPACE}
+                                
+                                echo "Waiting for canary deployment..."
+                                kubectl argo rollouts get rollout ${APP_NAME} -n ${NAMESPACE} --watch --timeout 600s
+                            '''
+                        } else {
+                            sh '''
+                                echo "Waiting for deployment to be ready..."
+                                kubectl wait --for=condition=available --timeout=300s deployment/${APP_NAME} -n ${NAMESPACE}
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                container('kubectl') {
+                    script {
+                        sh '''
+                            echo "Getting service endpoint..."
+                            SERVICE_IP=$(kubectl get svc ${APP_NAME} -n ${NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].ip}' || echo "cluster-ip")
+                            SERVICE_PORT=$(kubectl get svc ${APP_NAME} -n ${NAMESPACE} -o jsonpath='{.spec.ports[0].port}')
+                            
+                            if [ "$SERVICE_IP" = "cluster-ip" ]; then
+                                SERVICE_IP=$(kubectl get svc ${APP_NAME} -n ${NAMESPACE} -o jsonpath='{.spec.clusterIP}')
+                            fi
+                            
+                            echo "Testing health endpoint..."
+                            for i in {1..30}; do
+                                if curl -f "http://${SERVICE_IP}:${SERVICE_PORT}/health"; then
+                                    echo "Health check passed!"
+                                    break
+                                fi
+                                echo "Attempt $i failed, retrying in 10 seconds..."
+                                sleep 10
+                            done
+                            
+                            echo "Testing prediction endpoint..."
+                            curl -X POST "http://${SERVICE_IP}:${SERVICE_PORT}/predict" \
+                                -H "Content-Type: application/json" \
+                                -d '{"features": [1, 2, 3, 4, 5]}' | jq .
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Performance Testing') {
+            when {
+                expression { env.ENVIRONMENT == 'staging' || env.ENVIRONMENT == 'production' }
+            }
+            steps {
+                container('python') {
+                    script {
+                        sh '''
+                            echo "Installing performance testing tools..."
+                            pip install --no-cache-dir locust==2.17.*
+                            
+                            echo "Running performance tests..."
+                            locust \
+                                -f tests/performance/locustfile.py \
+                                --host http://${APP_NAME}.${NAMESPACE}.svc.cluster.local \
+                                --users 100 \
+                                --spawn-rate 10 \
+                                --run-time 5m \
+                                --html performance-report.html \
+                                --headless
+                        '''
+                        
+                        publishHTML([
+                            allowMissing: false,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: true,
+                            reportDir: '.',
+                            reportFiles: 'performance-report.html',
+                            reportName: 'Performance Test Report'
+                        ])
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                // Send metrics to Prometheus
+                sh '''
+                    curl -X POST "${PROMETHEUS_GATEWAY}/metrics/job/jenkins-ml-pipeline/instance/${BUILD_NUMBER}" \
+                        --data-binary "jenkins_build_duration_seconds $(( $(date +%s) - ${BUILD_TIMESTAMP:-$(date +%s)} ))
+jenkins_build_status{result=\\"${currentBuild.currentResult}\\"} 1" || true
+                '''
+                
+                // Clean up workspace
+                cleanWs()
+            }
+        }
+        
+        success {
+            script {
+                // Send notification
+                emailext(
+                    subject: "✅ ML Pipeline Success: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                        ML Pipeline completed successfully!
+                        
+                        Environment: ${env.ENVIRONMENT}
+                        Model Version: ${env.APP_VERSION}
+                        Docker Image: ${env.DOCKER_TAG}
+                        
+                        Build URL: ${env.BUILD_URL}
+                        
+                        Model Performance:
+                        - Accuracy: Check validation results
+                        - Bias Score: Check bias detection results  
+                        - Drift Score: Check drift detection results
+                        
+                        Next Steps:
+                        1. Monitor model performance in Grafana
+                        2. Check logs in Kibana
+                        3. Verify deployment health
+                        
+                        Built with ❤️ by Jenkins ML Pipeline
+                    """,
+                    to: "${env.CHANGE_AUTHOR_EMAIL ?: 'nguierochjunior@gmail.com'}"
+                )
+            }
+        }
+        
+        failure {
+            script {
+                emailext(
+                    subject: "❌ ML Pipeline Failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                        ML Pipeline failed at stage: ${env.STAGE_NAME ?: 'Unknown'}
+                        
+                        Environment: ${env.ENVIRONMENT}
+                        Build URL: ${env.BUILD_URL}
+                        Console Output: ${env.BUILD_URL}console
+                        
+                        Please check the logs and fix the issues.
+                        
+                        Common Issues:
+                        - Data validation failures
+                        - Model performance below threshold
+                        - Security vulnerabilities in dependencies
+                        - Container security scan failures
+                        
+                        Contact: nguierochjunior@gmail.com
+                    """,
+                    to: "${env.CHANGE_AUTHOR_EMAIL ?: 'nguierochjunior@gmail.com'}"
+                )
+            }
+        }
+        
+        unstable {
+            script {
+                emailext(
+                    subject: "⚠️ ML Pipeline Unstable: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                        ML Pipeline completed with warnings.
+                        
+                        Environment: ${env.ENVIRONMENT}
+                        Build URL: ${env.BUILD_URL}
+                        
+                        Please review the test results and warnings.
+                    """,
+                    to: "${env.CHANGE_AUTHOR_EMAIL ?: 'nguierochjunior@gmail.com'}"
+                )
+            }
+        }
+    }
+} 
